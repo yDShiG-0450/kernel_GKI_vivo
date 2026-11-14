@@ -670,10 +670,14 @@ PY
   grep -q  'return my_write_context(' "$SELINUXFS" \
     || selinux_hide_fail "selinuxfs.c 未把 context 改接为 my_write_context"
 
-  # CONFIG_KSU=m 时 __maybe_static 会展开成 static，hooks.c 的外部引用会链接失败
+  # CONFIG_KSU=m 时 __maybe_static 会展开成 static，hooks.c 的外部引用会链接失败。
+  # 注意：本脚本跑在「配置内核选项」之前，此刻 defconfig 里可能还没有 CONFIG_KSU 行，
+  # 只有显式写了 =m 才视为致命。
   if [[ -n "${DEFCONFIG:-}" ]] && [[ -f "$DEFCONFIG" ]]; then
-    grep -qx 'CONFIG_KSU=y' "$DEFCONFIG" \
-      || selinux_hide_fail "CONFIG_KSU 不是 =y，my_setprocattr 等符号无法被 hooks.c 引用"
+    if grep -qx 'CONFIG_KSU=m' "$DEFCONFIG"; then
+      selinux_hide_fail "CONFIG_KSU=m，__maybe_static 展开为 static，my_setprocattr 无法被 hooks.c 引用"
+    fi
+    echo "selinux_hide: defconfig 当前 CONFIG_KSU 状态: $(grep -E '^CONFIG_KSU=' "$DEFCONFIG" || echo '尚未写入（稍后由配置步骤追加）')"
   fi
 
   echo "==== selinux_hide 三通道一致性源码检查通过 ===="
