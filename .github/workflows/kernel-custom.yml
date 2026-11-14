@@ -105,6 +105,11 @@ on:
         required: false
         type: boolean
         default: false
+      use_fgetpriority:
+        description: "启用内核 fgetpriority 补丁（与 SUSFS PRIORITY_UID_FILTER 互斥，装了 BRENE 请保持 false）"
+        required: false
+        type: boolean
+        default: false
       use_networking:
         description: "启用网络增强（BBRv3 / IPSet / Qdisc / CIFS）"
         required: false
@@ -229,6 +234,7 @@ jobs:
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel || false }}
       use_nomount: ${{ inputs.use_nomount || false }}
+      use_fgetpriority: ${{ inputs.use_fgetpriority || false }}
       use_networking: ${{ inputs.use_networking || false }}
       networking_profile: ${{ inputs.networking_profile || 'all' }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}

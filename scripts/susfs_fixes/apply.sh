@@ -520,3 +520,161 @@ PY
     grep -n -A3 'handle_sel_write_context(struct file' "$SELINUXFS" | head -12
   fi
 fi
+
+# ===========================================================================
+# selinux_hide 三通道一致性（BakaSU + SUSFS）· 第二部分
+# 上面那段把 selinuxfs.c 的 access/context 垫片改接回 my_write_*（backup 策略），
+# 这里补上 /proc/<pid>/attr/current：SUSFS 的 handle_selinux_setprocattr 原本
+# 调 susfs_selinux_setprocattr，用 live 策略解析上下文；对 u:r:ksu:s0 这类被
+# 注入的类型会走到 -EACCES（CONTEXT_RECOGNIZED），与另外两路的 -EINVAL 口径
+# 分裂，检测器一交叉就穿。改接 my_setprocattr 之后三路统一由 backup_sepolicy
+# 回答。同时在 KernelSU 侧给 my_setprocattr / my_write_* 补 backup_sepolicy 判空。
+# ===========================================================================
+if [[ "$KSU_VARIANT" == "BakaSU" ]]; then
+  HOOKS="$KERNEL_ROOT/common/security/selinux/hooks.c"
+  SELINUXFS="$KERNEL_ROOT/common/security/selinux/selinuxfs.c"
+  KSU_HIDE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
+  KSU_MK="$KERNEL_ROOT/KernelSU/kernel/tools/susfs_compat.mk"
+
+  selinux_hide_fail() {
+    echo "::error::selinux_hide 三通道一致性检查失败: $*"
+    exit 1
+  }
+
+  # ---------- 1. 把 setprocattr 垫片改接回 my_setprocattr ----------
+  if [[ -f "$HOOKS" ]] && grep -qF 'susfs_selinux_setprocattr(name, value, size)' "$HOOKS"; then
+    python3 - "$HOOKS" <<'PY'
+import re, sys
+
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+
+if 'return my_setprocattr(' in s:
+    print('selinux_hide: setprocattr 路由补丁已存在，跳过')
+    sys.exit(0)
+
+anchor = 'static int handle_selinux_setprocattr(const char *name, void *value, size_t size)\n'
+decl = ('#ifdef CONFIG_KSU_SUSFS\n'
+        'extern int my_setprocattr(const char *name, void *value, size_t size);\n'
+        '#endif\n')
+if 'extern int my_setprocattr(' not in s:
+    if anchor not in s:
+        sys.exit('selinux_hide: 锚点缺失（handle_selinux_setprocattr），放弃')
+    s = s.replace(anchor, decl + anchor, 1)
+
+call = 'return susfs_selinux_setprocattr(name, value, size);'
+if s.count(call) != 1:
+    sys.exit('selinux_hide: setprocattr 调用点数量异常(%d)，放弃' % s.count(call))
+s = s.replace(call, 'return my_setprocattr(name, value, size);', 1)
+
+# 原垫片不再被调用，-Werror 会报 unused-function
+s, n = re.subn(r'static int (susfs_selinux_setprocattr)\(',
+               r'static int __attribute__((unused)) \1(', s)
+if n != 1:
+    sys.exit('selinux_hide: 未能标记 susfs_selinux_setprocattr 为 unused（匹配 %d 处）' % n)
+
+open(p, 'w', encoding='utf-8').write(s)
+print('selinux_hide: setprocattr 已改接 my_setprocattr（backup 策略）')
+PY
+
+    echo "==== selinux_hide: hooks.c 改接结果 ===="
+    sed -n '/static int handle_selinux_setprocattr/,/^}/p' "$HOOKS"
+    echo "==== selinux_hide: hooks.c 结束 ===="
+  fi
+
+  # ---------- 2. backup_sepolicy 判空（KernelSU 侧） ----------
+  # backup_sepolicy 在 hide 尚未 enable 时是 NULL；三个入口一旦被调用，
+  # security_context_to_sid_with_policy() 会直接解引用。判空后回 -EINVAL，
+  # 与「该上下文不存在」的语义一致，也不会在开机早期崩内核。
+  if [[ -f "$KSU_HIDE" ]]; then
+    python3 - "$KSU_HIDE" <<'PY'
+import re, sys
+
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+
+if 'if (unlikely(!backup_sepolicy))' in s:
+    print('selinux_hide: backup_sepolicy 判空已存在，跳过')
+    sys.exit(0)
+
+anchors = [
+    'my_write_context(struct file *file',
+    'my_write_access(struct file *file',
+]
+if 'ksu_handle_selinux_setprocattr(const char *name' in s:
+    anchors.append('ksu_handle_selinux_setprocattr(const char *name')
+elif 'my_setprocattr(const char *name' in s:
+    anchors.append('my_setprocattr(const char *name')
+else:
+    sys.exit('selinux_hide: 未找到 setprocattr 函数定义，放弃')
+
+call = 'security_context_to_sid_with_policy(backup_sepolicy,'
+inserted = 0
+for anchor in anchors:
+    start = s.find(anchor)
+    if start < 0:
+        sys.exit('selinux_hide: 未找到函数 %s，放弃' % anchor)
+    idx = s.find(call, start)
+    if idx < 0:
+        sys.exit('selinux_hide: %s 内未找到 backup_sepolicy 解析点，放弃' % anchor)
+    # 定位「语句」起点：调用可能写成  length =\n        security_context_to_sid_with_policy(...)
+    line_start = s.rfind('\n', 0, idx) + 1
+    prev_end = line_start - 1
+    if prev_end > 0:
+        prev_start = s.rfind('\n', 0, prev_end) + 1
+        prev_line = s[prev_start:prev_end].strip()
+        cur_prefix = s[line_start:idx].strip()
+        if prev_line.endswith('=') and cur_prefix == '':
+            line_start = prev_start
+    indent = re.match(r'[ \t]*', s[line_start:]).group(0)
+    guard = (indent + 'if (unlikely(!backup_sepolicy))\n' +
+             indent + '    return -EINVAL;\n')
+    s = s[:line_start] + guard + s[line_start:]
+    inserted += 1
+
+open(p, 'w', encoding='utf-8').write(s)
+print('selinux_hide: 已为 %d 个入口补 backup_sepolicy 判空' % inserted)
+PY
+  fi
+
+  # ---------- 3. 源码级硬断言：任何一项不符即中断，避免产出「口径分裂」内核 ----------
+  grep -q  'KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE' "$KSU_MK" \
+    || selinux_hide_fail "susfs_compat.mk 缺少 SELINUX_HIDE 兼容宏（SUSFS 未接管 selinux_hide）"
+
+  grep -qE 'ssize_t[[:space:]]+([[:alnum:]_]+[[:space:]]+)*my_write_access[[:space:]]*\(' "$KSU_HIDE" \
+    || selinux_hide_fail "my_write_access 不是可被外部引用的全局符号"
+  grep -qE 'ssize_t[[:space:]]+([[:alnum:]_]+[[:space:]]+)*my_write_context[[:space:]]*\(' "$KSU_HIDE" \
+    || selinux_hide_fail "my_write_context 不是可被外部引用的全局符号"
+
+  if grep -qE '^int[[:space:]]+my_setprocattr[[:space:]]*\(' "$KSU_HIDE"; then
+    :
+  elif grep -qE 'int[[:space:]]+__nocfi[[:space:]]+ksu_handle_selinux_setprocattr[[:space:]]*\(' "$KSU_HIDE"; then
+    # BakaSU main 的形态：定义名经 KSU_COMPAT_..._SELINUX_HIDE 宏改写成 my_setprocattr
+    :
+  else
+    selinux_hide_fail "selinux_hide.c 未找到可用的 setprocattr 实现"
+  fi
+
+  grep -q  'if (unlikely(!backup_sepolicy))' "$KSU_HIDE" \
+    || selinux_hide_fail "backup_sepolicy 判空未注入"
+
+  grep -q  'ksu_selinux_hide_running' "$HOOKS" \
+    || selinux_hide_fail "hooks.c 中缺少 ksu_selinux_hide_running（SUSFS selinux_hide 未生效）"
+  grep -q  'return my_setprocattr(' "$HOOKS" \
+    || selinux_hide_fail "hooks.c 未把 setprocattr 改接为 my_setprocattr"
+  grep -qE 'static int[[:space:]]+__attribute__\(\(unused\)\)[[:space:]]+susfs_selinux_setprocattr[[:space:]]*\(' "$HOOKS" \
+    || echo "::warning::selinux_hide: hooks.c 中的 susfs_selinux_setprocattr 未标记 unused"
+
+  grep -q  'return my_write_access(' "$SELINUXFS" \
+    || selinux_hide_fail "selinuxfs.c 未把 access 改接为 my_write_access"
+  grep -q  'return my_write_context(' "$SELINUXFS" \
+    || selinux_hide_fail "selinuxfs.c 未把 context 改接为 my_write_context"
+
+  # CONFIG_KSU=m 时 __maybe_static 会展开成 static，hooks.c 的外部引用会链接失败
+  if [[ -n "${DEFCONFIG:-}" ]] && [[ -f "$DEFCONFIG" ]]; then
+    grep -qx 'CONFIG_KSU=y' "$DEFCONFIG" \
+      || selinux_hide_fail "CONFIG_KSU 不是 =y，my_setprocattr 等符号无法被 hooks.c 引用"
+  fi
+
+  echo "==== selinux_hide 三通道一致性源码检查通过 ===="
+fi

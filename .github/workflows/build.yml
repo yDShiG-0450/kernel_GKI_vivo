@@ -60,6 +60,11 @@ on:
         required: false
         type: boolean
         default: false
+      use_fgetpriority:
+        description: 'fgetpriority 内核补丁（与 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 互斥，装了 BRENE 请保持 false）'
+        required: false
+        type: boolean
+        default: false
       use_nomount:
         required: false
         type: boolean
@@ -1488,10 +1493,17 @@ jobs:
 
           VERSION_INPUT=$(echo "${{ inputs.version }}" | tr -d '[:space:]')
           if [ -n "$VERSION_INPUT" ]; then
-            CLEAN_VERSION=$(echo "$VERSION_INPUT" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')
+            # 去掉前导 x.y.z，再去掉构建串里可能带进来的 dirty 后缀（-dirty / -maybe-dirty）
+            CLEAN_VERSION=$(echo "$VERSION_INPUT" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//; s/(-maybe-dirty|-dirty)+$//')
+            if [ -n "$CLEAN_VERSION" ] && [[ ! "$CLEAN_VERSION" =~ ^-[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::version 形态异常: '$CLEAN_VERSION'（原始输入: '$VERSION_INPUT'）"
+              exit 1
+            fi
+            echo "最终注入 CONFIG_LOCALVERSION='$CLEAN_VERSION'"
             perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"${CLEAN_VERSION}"'"/s' ./common/scripts/setlocalversion 2>/dev/null || true
             sed -i "\$s|echo \"\$res\"|echo \"${CLEAN_VERSION}\"|" ./common/scripts/setlocalversion 2>/dev/null || true
             sed -i '/^CONFIG_LOCALVERSION=/ s/="\([^"]*\)"/="'"$CLEAN_VERSION"'"/' ./common/arch/arm64/configs/gki_defconfig
+            sed -i 's/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' ./common/arch/arm64/configs/gki_defconfig
           elif [ ! -f "build/build.sh" ]; then
             cd ./common
             BID="ab$((RANDOM % 90000000 + 10000000))"
@@ -1558,19 +1570,36 @@ jobs:
             fi
           fi
 
-      - name: 集成 fgetpriority（隐藏 getpriority 探测）
+      - name: 集成 getpriority 过滤（fgetpriority 与 SUSFS 原生二选一）
         if: inputs.ksu_variant == 'BakaSU'
         run: |
           set -euo pipefail
-          SRC="$GITHUB_WORKSPACE/scripts/fgetpriority"
-          DST="$KERNEL_ROOT/common/drivers/fgetpriority"
-          rm -rf "$DST"
-          mkdir -p "$DST"
-          cp -f "$SRC"/*.c "$SRC"/*.h "$SRC"/Makefile "$DST"/
-          if ! grep -q 'fgetpriority' "$KERNEL_ROOT/common/drivers/Makefile"; then
-            echo 'obj-y += fgetpriority/' >> "$KERNEL_ROOT/common/drivers/Makefile"
+          PUID_OPT=""
+          if [ -f "$DEFCONFIG" ]; then
+            PUID_OPT="$(grep -E '^CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=' "$DEFCONFIG" | tail -n 1 | cut -d= -f2 || true)"
           fi
-          echo "fgetpriority 已并入 drivers/，随内核一起编译"
+
+          if [ "${{ inputs.use_fgetpriority }}" = "true" ]; then
+            if [ "$PUID_OPT" = "y" ]; then
+              echo "::error::fgetpriority 与 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y 互斥，禁止同时启用"
+              exit 1
+            fi
+            SRC="$GITHUB_WORKSPACE/scripts/fgetpriority"
+            DST="$KERNEL_ROOT/common/drivers/fgetpriority"
+            rm -rf "$DST"
+            mkdir -p "$DST"
+            cp -f "$SRC"/*.c "$SRC"/*.h "$SRC"/Makefile "$DST"/
+            if ! grep -q 'fgetpriority' "$KERNEL_ROOT/common/drivers/Makefile"; then
+              echo 'obj-y += fgetpriority/' >> "$KERNEL_ROOT/common/drivers/Makefile"
+            fi
+            echo "getpriority filter: 使用内核 fgetpriority 补丁（SUSFS PRIORITY_UID_FILTER 未开启）"
+          else
+            if [ "$PUID_OPT" != "y" ]; then
+              echo "::warning::getpriority filter: 已跳过 fgetpriority，但 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 不是 y（当前: '${PUID_OPT:-未设置}'），该探测不会被过滤"
+            else
+              echo "getpriority filter: 使用 SUSFS 原生 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER（已跳过 fgetpriority）"
+            fi
+          fi
 
       - name: 编译内核
         id: compile_kernel
@@ -1643,6 +1672,36 @@ jobs:
               echo "退出码: $BUILD_STATUS"
             } >> "$LOG_FILE"
             exit "$BUILD_STATUS"
+
+      - name: 校验版本串与 selinux_hide 符号
+        if: success() && inputs.ksu_variant == 'BakaSU'
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -uo pipefail
+
+          UTS_FILE=$(find . -name utsrelease.h -type f 2>/dev/null | head -n 1)
+          if [ -n "$UTS_FILE" ]; then
+            echo "UTS_RELEASE: $(tr -d '\n' < "$UTS_FILE")"
+            if grep -qi 'dirty' "$UTS_FILE"; then
+              echo "::error::UTS_RELEASE 仍包含 dirty: $(tr -d '\n' < "$UTS_FILE")"
+              exit 1
+            fi
+          else
+            echo "::warning::未找到 utsrelease.h，跳过版本串校验"
+          fi
+
+          SMAP=$(find . -name System.map -type f 2>/dev/null | head -n 1)
+          if [ -z "$SMAP" ]; then
+            echo "::warning::未找到 System.map，跳过符号校验"
+            exit 0
+          fi
+          echo "System.map: $SMAP"
+
+          grep -qE ' ksu_selinux_hide_running(\.|$)' "$SMAP" || { echo "::error::System.map 缺失 ksu_selinux_hide_running"; exit 1; }
+          grep -qE ' (handle_selinux_setprocattr|selinux_setprocattr)(\.|$)' "$SMAP" || { echo "::error::System.map 缺失 selinux setprocattr 相关符号"; exit 1; }
+
+          echo "--- LTO 可能把 my_* 内联，以下仅留档 ---"
+          grep -E ' (my_setprocattr|my_write_access|my_write_context)(\.|$)' "$SMAP" || echo "（未在 System.map 中找到，可能已被 LTO 内联，不影响判定）"
 
       - name: 整理编译失败日志
         if: ${{ always() && steps.compile_kernel.outcome == 'failure' }}
