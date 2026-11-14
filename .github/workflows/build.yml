@@ -1558,6 +1558,20 @@ jobs:
             fi
           fi
 
+      - name: 集成 fgetpriority（隐藏 getpriority 探测）
+        if: inputs.ksu_variant == 'BakaSU'
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/scripts/fgetpriority"
+          DST="$KERNEL_ROOT/common/drivers/fgetpriority"
+          rm -rf "$DST"
+          mkdir -p "$DST"
+          cp -f "$SRC"/*.c "$SRC"/*.h "$SRC"/Makefile "$DST"/
+          if ! grep -q 'fgetpriority' "$KERNEL_ROOT/common/drivers/Makefile"; then
+            echo 'obj-y += fgetpriority/' >> "$KERNEL_ROOT/common/drivers/Makefile"
+          fi
+          echo "fgetpriority 已并入 drivers/，随内核一起编译"
+
       - name: 编译内核
         id: compile_kernel
         uses: nick-fields/retry@v4
