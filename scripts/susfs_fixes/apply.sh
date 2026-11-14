@@ -462,3 +462,55 @@ if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
     echo "已修复 setuid_hook.c 重复定义问题"
   fi
 fi
+
+# ===========================================================================
+# selinux_hide 路由修复（BakaSU + SUSFS）
+# SUSFS 在 selinuxfs 里挂的垫片用 live 策略计算 access/context 的结果，
+# KernelSU 注入的类型与规则因此仍然对 app 可见，隐藏开关等于没生效。
+# 这里只把垫片里「uid >= 10000 且 hide 运行中」那一支的被调用者，换成
+# KernelSU 自己的 my_write_access / my_write_context（基于 backup_sepolicy）。
+# ===========================================================================
+if [[ "${KSU_VARIANT}" == "BakaSU" ]]; then
+  SELINUXFS="$KERNEL_ROOT/common/security/selinux/selinuxfs.c"
+  if [[ -f "$SELINUXFS" ]]; then
+    echo "==== selinux_hide: 构建时实际使用的 SUSFS 垫片 ===="
+    sed -n '/handle_sel_write_access/,/^}/p' "$SELINUXFS"
+    sed -n '/handle_sel_write_context/,/^}/p' "$SELINUXFS"
+    echo "==== selinux_hide: 垫片结束 ===="
+
+    python3 - "$SELINUXFS" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+
+if 'return my_write_access(' in s:
+    print('selinux_hide: 路由补丁已存在，跳过')
+    sys.exit(0)
+
+decl = ('#ifdef CONFIG_KSU_SUSFS\n'
+        'extern ssize_t my_write_access(struct file *, char *, size_t);\n'
+        'extern ssize_t my_write_context(struct file *, char *, size_t);\n'
+        '#endif\n')
+if 'my_write_access(struct file' not in s:
+    anchor = 'extern void initialize_fake_status(void);\n'
+    if anchor not in s:
+        sys.exit('selinux_hide: 锚点缺失（initialize_fake_status 声明），放弃')
+    s = s.replace(anchor, anchor + decl, 1)
+
+for kind in ('access', 'context'):
+    pat = re.compile(
+        r'(static ssize_t handle_sel_write_%s\(struct file \*file, char \*buf, size_t size\)'
+        r'\s*\{.*?return\s+)susfs_sel_write_%s\(file, buf, size\)' % (kind, kind), re.S)
+    s, n = pat.subn(lambda m: m.group(1) + 'my_write_%s(file, buf, size)' % kind, s, count=1)
+    if n != 1:
+        sys.exit('selinux_hide: 锚点缺失（handle_sel_write_%s），放弃' % kind)
+
+open(p, 'w', encoding='utf-8').write(s)
+print('selinux_hide: 已把 access/context 垫片改接 my_write_*')
+PY
+
+    echo "==== selinux_hide: 修改后的结果 ===="
+    grep -n -A3 'handle_sel_write_access(struct file' "$SELINUXFS" | head -12
+    grep -n -A3 'handle_sel_write_context(struct file' "$SELINUXFS" | head -12
+  fi
+fi
