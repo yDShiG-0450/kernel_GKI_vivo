@@ -1242,9 +1242,11 @@ jobs:
 
           # 网络增强档位: all=全套 / bbr3=仅拥塞控制 / bbr3+qdisc=BBRv3+队列
           PROFILE="${{ inputs.networking_profile }}"
+          # 表单显示值可能带中文后缀，按前缀归一化
           case "$PROFILE" in
-            all|bbr3|bbr3+qdisc) ;;
-            *) PROFILE="all" ;;
+            bbr3+qdisc*) PROFILE="bbr3+qdisc" ;;
+            bbr3*)       PROFILE="bbr3" ;;
+            *)           PROFILE="all" ;;
           esac
 
           # ---------- BBRv3 补丁：按版本分派（来自 WildKernels/kernel_patches） ----------
