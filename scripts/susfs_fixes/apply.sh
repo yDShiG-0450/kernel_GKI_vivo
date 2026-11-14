@@ -505,6 +505,12 @@ for kind in ('access', 'context'):
     if n != 1:
         sys.exit('selinux_hide: 锚点缺失（handle_sel_write_%s），放弃' % kind)
 
+# 调用点换掉后，两个 static 垫片就没人用了，内核 -Werror 会直接报 unused-function
+s, n = re.subn(r'static ssize_t (susfs_sel_write_(?:access|context))\(',
+               r'static ssize_t __attribute__((unused)) \1(', s)
+if n != 2:
+    sys.exit('selinux_hide: 未能给 susfs_sel_write_* 标记 unused（匹配 %d 处），放弃' % n)
+
 open(p, 'w', encoding='utf-8').write(s)
 print('selinux_hide: 已把 access/context 垫片改接 my_write_*')
 PY
